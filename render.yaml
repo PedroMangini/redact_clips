@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: ffmpeg-api
+    runtime: docker
+    plan: starter
+    envVars:
+      - key: PORT
+        value: 10000
+    healthCheckPath: /health
+    autoDeploy: true
