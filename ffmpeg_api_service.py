@@ -22,7 +22,7 @@ import os
 import subprocess
 import uuid
 import requests
-from threading import Thread
+from threading import Thread, Lock
 import time
 import logging
 
@@ -41,8 +41,9 @@ OUTPUT_DIR = '/tmp/outputs'
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# Store job status
+# Store job status with thread safety
 jobs = {}
+jobs_lock = Lock()
 
 def cleanup_old_files():
     """Remove files older than 1 hour"""
@@ -101,11 +102,30 @@ def download_video(url, output_path):
         logger.error(f"Download error: {e}")
         return False
 
-def process_video_async(job_id, input_path, output_path, ffmpeg_command, callback_url=None, base_url=None):
+def process_video_async(job_id, video_url, input_path, output_path, ffmpeg_command, callback_url=None, base_url=None):
     """Process video asynchronously"""
     try:
-        jobs[job_id]['status'] = 'processing'
-        jobs[job_id]['progress'] = 10
+        # Update to downloading status
+        with jobs_lock:
+            jobs[job_id]['status'] = 'downloading'
+            jobs[job_id]['progress'] = 5
+        
+        # Download video
+        if not download_video(video_url, input_path):
+            with jobs_lock:
+                jobs[job_id]['status'] = 'failed'
+                jobs[job_id]['error'] = 'Failed to download video'
+            
+            if callback_url:
+                send_callback(callback_url, job_id, 'failed', {
+                    'error': 'Failed to download video'
+                })
+            return
+        
+        # Update to processing status
+        with jobs_lock:
+            jobs[job_id]['status'] = 'processing'
+            jobs[job_id]['progress'] = 20
         
         logger.info(f"Processing job {job_id}: {ffmpeg_command}")
         
@@ -119,22 +139,53 @@ def process_video_async(job_id, input_path, output_path, ffmpeg_command, callbac
         )
         
         if result.returncode == 0:
-            jobs[job_id]['status'] = 'completed'
-            jobs[job_id]['progress'] = 100
-            jobs[job_id]['output_path'] = output_path
-            logger.info(f"Job {job_id} completed successfully")
+            # Verify output file exists and is valid
+            if not os.path.exists(output_path):
+                raise Exception(f"Output file not found: {output_path}")
             
-            # Send success callback
-            if callback_url:
-                download_url = f"{base_url}/download/{job_id}" if base_url else f"/download/{job_id}"
-                send_callback(callback_url, job_id, 'completed', {
-                    'download_url': download_url,
-                    'message': 'Video processed successfully'
-                })
+            file_size = os.path.getsize(output_path)
+            if file_size == 0:
+                raise Exception("Output file is empty")
+            
+            # Mark as completed with all info
+            with jobs_lock:
+                jobs[job_id]['status'] = 'completed'
+                jobs[job_id]['progress'] = 100
+                jobs[job_id]['output_path'] = output_path
+                jobs[job_id]['file_size'] = file_size
+                jobs[job_id]['completed_at'] = time.time()
+            
+            logger.info(f"Job {job_id} completed successfully. File size: {file_size} bytes")
+            
+            # Small delay to ensure filesystem sync
+            time.sleep(0.3)
+            
+            # Verify file one more time before callback
+            if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                # Send success callback
+                if callback_url:
+                    download_url = f"{base_url}/download/{job_id}" if base_url else f"/download/{job_id}"
+                    send_callback(callback_url, job_id, 'completed', {
+                        'download_url': download_url,
+                        'message': 'Video processed successfully',
+                        'file_size': file_size
+                    })
+            else:
+                logger.error(f"File disappeared before callback for job {job_id}")
+                with jobs_lock:
+                    jobs[job_id]['status'] = 'failed'
+                    jobs[job_id]['error'] = 'Output file verification failed'
+                
+                if callback_url:
+                    send_callback(callback_url, job_id, 'failed', {
+                        'error': 'Output file verification failed'
+                    })
         else:
             error_msg = result.stderr
-            jobs[job_id]['status'] = 'failed'
-            jobs[job_id]['error'] = error_msg
+            with jobs_lock:
+                jobs[job_id]['status'] = 'failed'
+                jobs[job_id]['error'] = error_msg
+            
             logger.error(f"Job {job_id} failed: {error_msg}")
             
             # Send error callback
@@ -145,8 +196,10 @@ def process_video_async(job_id, input_path, output_path, ffmpeg_command, callbac
             
     except subprocess.TimeoutExpired:
         error_msg = 'Processing timeout (max 10 minutes)'
-        jobs[job_id]['status'] = 'failed'
-        jobs[job_id]['error'] = error_msg
+        with jobs_lock:
+            jobs[job_id]['status'] = 'failed'
+            jobs[job_id]['error'] = error_msg
+        
         logger.error(f"Job {job_id} timed out")
         
         # Send timeout callback
@@ -157,8 +210,10 @@ def process_video_async(job_id, input_path, output_path, ffmpeg_command, callbac
             
     except Exception as e:
         error_msg = str(e)
-        jobs[job_id]['status'] = 'failed'
-        jobs[job_id]['error'] = error_msg
+        with jobs_lock:
+            jobs[job_id]['status'] = 'failed'
+            jobs[job_id]['error'] = error_msg
+        
         logger.error(f"Job {job_id} error: {e}")
         
         # Send error callback
@@ -170,10 +225,13 @@ def process_video_async(job_id, input_path, output_path, ffmpeg_command, callbac
 @app.route('/health', methods=['GET'])
 def health():
     """Health check endpoint"""
+    with jobs_lock:
+        active_jobs = len([j for j in jobs.values() if j['status'] == 'processing'])
+    
     return jsonify({
         'status': 'healthy',
         'ffmpeg_installed': os.system('which ffmpeg') == 0,
-        'active_jobs': len([j for j in jobs.values() if j['status'] == 'processing'])
+        'active_jobs': active_jobs
     })
 
 @app.route('/blur', methods=['POST'])
@@ -207,26 +265,15 @@ def blur_video():
         input_path = os.path.join(UPLOAD_DIR, f"{job_id}_input.mp4")
         output_path = os.path.join(OUTPUT_DIR, f"{job_id}_output.mp4")
         
-        # Initialize job
-        jobs[job_id] = {
-            'status': 'downloading',
-            'progress': 0,
-            'created_at': time.time(),
-            'callback_url': callback_url
-        }
-        
-        # Download video
-        if not download_video(video_url, input_path):
-            jobs[job_id]['status'] = 'failed'
-            jobs[job_id]['error'] = 'Failed to download video'
-            
-            # Send error callback
-            if callback_url:
-                send_callback(callback_url, job_id, 'failed', {
-                    'error': 'Failed to download video'
-                })
-            
-            return jsonify({'error': 'Failed to download video'}), 400
+        # Initialize job BEFORE starting thread
+        with jobs_lock:
+            jobs[job_id] = {
+                'status': 'queued',
+                'progress': 0,
+                'created_at': time.time(),
+                'callback_url': callback_url,
+                'video_url': video_url
+            }
         
         # FFmpeg command
         ffmpeg_cmd = f"ffmpeg -i {input_path} -vf 'boxblur={blur_amount}:{sigma}' -c:a copy -y {output_path}"
@@ -235,13 +282,17 @@ def blur_video():
         base_url = request.url_root.rstrip('/')
         
         # Start processing in background
-        thread = Thread(target=process_video_async, args=(job_id, input_path, output_path, ffmpeg_cmd, callback_url, base_url))
+        thread = Thread(
+            target=process_video_async, 
+            args=(job_id, video_url, input_path, output_path, ffmpeg_cmd, callback_url, base_url)
+        )
+        thread.daemon = True
         thread.start()
         
         response_data = {
             'job_id': job_id,
-            'status': 'processing',
-            'message': 'Video processing started',
+            'status': 'queued',
+            'message': 'Video processing queued',
             'status_url': f'/status/{job_id}',
             'download_url': f'/download/{job_id}'
         }
@@ -290,23 +341,14 @@ def blur_region():
         input_path = os.path.join(UPLOAD_DIR, f"{job_id}_input.mp4")
         output_path = os.path.join(OUTPUT_DIR, f"{job_id}_output.mp4")
         
-        jobs[job_id] = {
-            'status': 'downloading',
-            'progress': 0,
-            'created_at': time.time(),
-            'callback_url': callback_url
-        }
-        
-        if not download_video(video_url, input_path):
-            jobs[job_id]['status'] = 'failed'
-            jobs[job_id]['error'] = 'Failed to download video'
-            
-            if callback_url:
-                send_callback(callback_url, job_id, 'failed', {
-                    'error': 'Failed to download video'
-                })
-            
-            return jsonify({'error': 'Failed to download video'}), 400
+        with jobs_lock:
+            jobs[job_id] = {
+                'status': 'queued',
+                'progress': 0,
+                'created_at': time.time(),
+                'callback_url': callback_url,
+                'video_url': video_url
+            }
         
         # FFmpeg command for region blur
         ffmpeg_cmd = f"""ffmpeg -i {input_path} -filter_complex \
@@ -316,12 +358,17 @@ def blur_region():
         
         base_url = request.url_root.rstrip('/')
         
-        thread = Thread(target=process_video_async, args=(job_id, input_path, output_path, ffmpeg_cmd, callback_url, base_url))
+        thread = Thread(
+            target=process_video_async, 
+            args=(job_id, video_url, input_path, output_path, ffmpeg_cmd, callback_url, base_url)
+        )
+        thread.daemon = True
         thread.start()
         
         response_data = {
             'job_id': job_id,
-            'status': 'processing',
+            'status': 'queued',
+            'message': 'Video processing queued',
             'status_url': f'/status/{job_id}',
             'download_url': f'/download/{job_id}'
         }
@@ -361,42 +408,33 @@ def pixelate_video():
         input_path = os.path.join(UPLOAD_DIR, f"{job_id}_input.mp4")
         output_path = os.path.join(OUTPUT_DIR, f"{job_id}_output.mp4")
         
-        jobs[job_id] = {
-            'status': 'downloading',
-            'progress': 0,
-            'created_at': time.time(),
-            'callback_url': callback_url
-        }
+        with jobs_lock:
+            jobs[job_id] = {
+                'status': 'queued',
+                'progress': 0,
+                'created_at': time.time(),
+                'callback_url': callback_url,
+                'video_url': video_url
+            }
         
-        if not download_video(video_url, input_path):
-            jobs[job_id]['status'] = 'failed'
-            jobs[job_id]['error'] = 'Failed to download video'
-            
-            if callback_url:
-                send_callback(callback_url, job_id, 'failed', {
-                    'error': 'Failed to download video'
-                })
-            
-            return jsonify({'error': 'Failed to download video'}), 400
-        
-        # Get video dimensions
-        probe_cmd = f"ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0 {input_path}"
-        result = subprocess.run(probe_cmd, shell=True, capture_output=True, text=True)
-        width, height = result.stdout.strip().split(',')
-        
-        small_w = int(int(width) / pixel_size)
-        small_h = int(int(height) / pixel_size)
-        
-        ffmpeg_cmd = f"ffmpeg -i {input_path} -vf 'scale={small_w}:{small_h},scale={width}:{height}:flags=neighbor' -c:a copy -y {output_path}"
+        # Get video dimensions (will be done after download in async function)
+        # For now, we'll pass a placeholder command that will be modified
+        ffmpeg_cmd = f"PIXELATE:{pixel_size}"
         
         base_url = request.url_root.rstrip('/')
         
-        thread = Thread(target=process_video_async, args=(job_id, input_path, output_path, ffmpeg_cmd, callback_url, base_url))
+        # Special handling for pixelate
+        thread = Thread(
+            target=process_pixelate_async, 
+            args=(job_id, video_url, input_path, output_path, pixel_size, callback_url, base_url)
+        )
+        thread.daemon = True
         thread.start()
         
         response_data = {
             'job_id': job_id,
-            'status': 'processing',
+            'status': 'queued',
+            'message': 'Video processing queued',
             'status_url': f'/status/{job_id}',
             'download_url': f'/download/{job_id}'
         }
@@ -410,13 +448,129 @@ def pixelate_video():
         logger.error(f"Pixelate error: {e}")
         return jsonify({'error': str(e)}), 500
 
+def process_pixelate_async(job_id, video_url, input_path, output_path, pixel_size, callback_url=None, base_url=None):
+    """Process pixelate video asynchronously - needs to probe video first"""
+    try:
+        # Update to downloading
+        with jobs_lock:
+            jobs[job_id]['status'] = 'downloading'
+            jobs[job_id]['progress'] = 5
+        
+        # Download video
+        if not download_video(video_url, input_path):
+            with jobs_lock:
+                jobs[job_id]['status'] = 'failed'
+                jobs[job_id]['error'] = 'Failed to download video'
+            
+            if callback_url:
+                send_callback(callback_url, job_id, 'failed', {
+                    'error': 'Failed to download video'
+                })
+            return
+        
+        # Get video dimensions
+        with jobs_lock:
+            jobs[job_id]['status'] = 'analyzing'
+            jobs[job_id]['progress'] = 15
+        
+        probe_cmd = f"ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0 {input_path}"
+        result = subprocess.run(probe_cmd, shell=True, capture_output=True, text=True)
+        
+        if result.returncode != 0:
+            raise Exception("Failed to probe video dimensions")
+        
+        width, height = result.stdout.strip().split(',')
+        small_w = int(int(width) / pixel_size)
+        small_h = int(int(height) / pixel_size)
+        
+        ffmpeg_cmd = f"ffmpeg -i {input_path} -vf 'scale={small_w}:{small_h},scale={width}:{height}:flags=neighbor' -c:a copy -y {output_path}"
+        
+        # Now process with the actual command
+        with jobs_lock:
+            jobs[job_id]['status'] = 'processing'
+            jobs[job_id]['progress'] = 20
+        
+        logger.info(f"Processing job {job_id}: {ffmpeg_cmd}")
+        
+        result = subprocess.run(
+            ffmpeg_cmd,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=600
+        )
+        
+        if result.returncode == 0:
+            # Verify output
+            if not os.path.exists(output_path):
+                raise Exception(f"Output file not found: {output_path}")
+            
+            file_size = os.path.getsize(output_path)
+            if file_size == 0:
+                raise Exception("Output file is empty")
+            
+            with jobs_lock:
+                jobs[job_id]['status'] = 'completed'
+                jobs[job_id]['progress'] = 100
+                jobs[job_id]['output_path'] = output_path
+                jobs[job_id]['file_size'] = file_size
+                jobs[job_id]['completed_at'] = time.time()
+            
+            logger.info(f"Job {job_id} completed. File size: {file_size} bytes")
+            
+            # Delay for filesystem sync
+            time.sleep(0.3)
+            
+            if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                if callback_url:
+                    download_url = f"{base_url}/download/{job_id}" if base_url else f"/download/{job_id}"
+                    send_callback(callback_url, job_id, 'completed', {
+                        'download_url': download_url,
+                        'message': 'Video processed successfully',
+                        'file_size': file_size
+                    })
+            else:
+                with jobs_lock:
+                    jobs[job_id]['status'] = 'failed'
+                    jobs[job_id]['error'] = 'Output file verification failed'
+                
+                if callback_url:
+                    send_callback(callback_url, job_id, 'failed', {
+                        'error': 'Output file verification failed'
+                    })
+        else:
+            error_msg = result.stderr
+            with jobs_lock:
+                jobs[job_id]['status'] = 'failed'
+                jobs[job_id]['error'] = error_msg
+            
+            if callback_url:
+                send_callback(callback_url, job_id, 'failed', {
+                    'error': error_msg
+                })
+    
+    except Exception as e:
+        error_msg = str(e)
+        with jobs_lock:
+            jobs[job_id]['status'] = 'failed'
+            jobs[job_id]['error'] = error_msg
+        
+        logger.error(f"Job {job_id} error: {e}")
+        
+        if callback_url:
+            send_callback(callback_url, job_id, 'failed', {
+                'error': error_msg
+            })
+
 @app.route('/status/<job_id>', methods=['GET'])
 def get_status(job_id):
     """Get job status"""
-    if job_id not in jobs:
-        return jsonify({'error': 'Job not found'}), 404
+    with jobs_lock:
+        if job_id not in jobs:
+            return jsonify({'error': 'Job not found'}), 404
+        
+        job = jobs[job_id].copy()
     
-    job = jobs[job_id]
     response = {
         'job_id': job_id,
         'status': job['status'],
@@ -425,6 +579,8 @@ def get_status(job_id):
     
     if job['status'] == 'completed':
         response['download_url'] = f'/download/{job_id}'
+        if 'file_size' in job:
+            response['file_size'] = job['file_size']
     elif job['status'] == 'failed':
         response['error'] = job.get('error', 'Unknown error')
     
@@ -432,26 +588,49 @@ def get_status(job_id):
 
 @app.route('/download/<job_id>', methods=['GET'])
 def download_result(job_id):
-    """Download processed video"""
-    if job_id not in jobs:
-        return jsonify({'error': 'Job not found'}), 404
-    
-    job = jobs[job_id]
+    """Download processed video with retry logic"""
+    with jobs_lock:
+        if job_id not in jobs:
+            return jsonify({'error': 'Job not found'}), 404
+        
+        job = jobs[job_id].copy()
     
     if job['status'] != 'completed':
-        return jsonify({'error': f"Job not completed. Status: {job['status']}"}), 400
+        return jsonify({
+            'error': f"Job not completed. Status: {job['status']}",
+            'current_status': job['status'],
+            'progress': job.get('progress', 0)
+        }), 400
     
     output_path = job.get('output_path')
     
-    if not output_path or not os.path.exists(output_path):
-        return jsonify({'error': 'Output file not found'}), 404
+    if not output_path:
+        return jsonify({'error': 'Output path not set'}), 500
     
-    return send_file(
-        output_path,
-        mimetype='video/mp4',
-        as_attachment=True,
-        download_name=f'processed_{job_id}.mp4'
-    )
+    # Retry logic: try 3 times with delays
+    max_retries = 3
+    for attempt in range(max_retries):
+        if os.path.exists(output_path):
+            file_size = os.path.getsize(output_path)
+            if file_size > 0:
+                logger.info(f"Serving file {output_path} ({file_size} bytes) for job {job_id} on attempt {attempt + 1}")
+                return send_file(
+                    output_path,
+                    mimetype='video/mp4',
+                    as_attachment=True,
+                    download_name=f'processed_{job_id}.mp4'
+                )
+        
+        if attempt < max_retries - 1:
+            logger.warning(f"File not ready for job {job_id}, retry {attempt + 1}/{max_retries}")
+            time.sleep(0.5)  # Wait 500ms before retry
+    
+    # File really doesn't exist
+    logger.error(f"Output file not found after {max_retries} retries: {output_path}")
+    return jsonify({
+        'error': 'Output file not found or empty',
+        'job_id': job_id
+    }), 404
 
 @app.route('/', methods=['GET'])
 def index():
@@ -506,7 +685,8 @@ def index():
   "status": "completed",
   "timestamp": 1234567890,
   "download_url": "https://api.com/download/uuid",
-  "message": "Video processed successfully"
+  "message": "Video processed successfully",
+  "file_size": 12345678
 }
 
 // Error:
@@ -522,10 +702,20 @@ def index():
         <p>Check processing status</p>
         
         <h3>GET /download/:job_id</h3>
-        <p>Download processed video</p>
+        <p>Download processed video (with automatic retry logic)</p>
         
         <h3>GET /health</h3>
         <p>Health check</p>
+        
+        <h2>Status Values:</h2>
+        <ul>
+            <li><strong>queued</strong> - Job accepted and waiting to start</li>
+            <li><strong>downloading</strong> - Downloading source video</li>
+            <li><strong>analyzing</strong> - Analyzing video properties</li>
+            <li><strong>processing</strong> - Processing video with FFmpeg</li>
+            <li><strong>completed</strong> - Processing finished successfully</li>
+            <li><strong>failed</strong> - Processing failed (check error field)</li>
+        </ul>
     </body>
     </html>
     """
